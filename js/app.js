@@ -97,6 +97,85 @@ async function share(m) {
 }
 
 /* ------------------------------------------------------------------ *
+ * Offline reading
+ * Every issue a reader opens is kept in the Cache API; sw.js serves it
+ * from there when there's no connection.
+ * ------------------------------------------------------------------ */
+const ISSUE_CACHE = 'mag-issues';
+const hasCaches = 'caches' in window;
+const saved = new Set();   // absolute URLs of issues saved for offline
+
+if ('serviceWorker' in navigator) {
+  addEventListener('load', () => navigator.serviceWorker.register('sw.js').catch(() => {}));
+}
+
+async function loadSaved() {
+  if (!hasCaches) return;
+  try {
+    const c = await caches.open(ISSUE_CACHE);
+    for (const r of await c.keys()) saved.add(r.url);
+  } catch { /* storage blocked */ }
+}
+
+async function saveOffline(m, doc) {
+  if (!hasCaches) return;
+  const url = absUrl(m);
+  if (saved.has(url)) return;
+  try {
+    const c = await caches.open(ISSUE_CACHE);
+    try {
+      const data = await doc.getData();        // resolves once PDF.js has the whole file
+      await c.put(url, new Response(data, {
+        headers: { 'Content-Type': 'application/pdf', 'Content-Length': String(data.byteLength), 'Accept-Ranges': 'bytes' },
+      }));
+    } catch {
+      // Reader closed before the download finished: fetch the file on its own.
+      await c.add(url);
+    }
+    saved.add(url);
+    navigator.storage?.persist?.().catch(() => {});
+    markSaved(m);
+    if (V.m === m) toast('Saved for offline reading');
+  } catch { /* quota exceeded or offline */ }
+}
+
+function markSaved(m) {
+  m = catalog.find((x) => x.file === m.file) || m;
+  const el = m._el && $('.cover', m._el);
+  if (el && !$('.saved', el)) el.insertAdjacentHTML('beforeend', '<span class="saved" title="Saved for offline reading">Offline</span>');
+}
+
+/* Drop saved copies whose file was replaced on the server (size changed). */
+async function pruneSaved() {
+  if (!hasCaches || !navigator.onLine) return;
+  try {
+    const c = await caches.open(ISSUE_CACHE);
+    const bySize = new Map(catalog.map((m) => [absUrl(m), m.size]));
+    for (const req of await c.keys()) {
+      if (!bySize.has(req.url)) continue;
+      const res = await c.match(req);
+      const len = Number(res?.headers.get('Content-Length'));
+      if (bySize.get(req.url) && len && len !== bySize.get(req.url)) {
+        await c.delete(req);
+        saved.delete(req.url);
+        const m = catalog.find((x) => absUrl(x) === req.url);
+        m?._el && $('.saved', m._el)?.remove();
+      }
+    }
+  } catch { /* ignore */ }
+}
+
+/* With no connection and no cached manifest, list whatever is saved. */
+function catalogFromSaved() {
+  const base = new URL('.', location.href).href;
+  return [...saved].filter((u) => u.startsWith(base)).map((u) => {
+    const file = decodeURIComponent(u.slice(base.length));
+    const name = file.split('/').pop();
+    return { file, name, title: titleFromName(name), size: 0, date: null };
+  }).sort((a, b) => b.name.localeCompare(a.name, undefined, { numeric: true }));
+}
+
+/* ------------------------------------------------------------------ *
  * Catalog (home page)
  * ------------------------------------------------------------------ */
 let catalog = [];
@@ -111,14 +190,20 @@ async function loadCatalog() {
   } catch { /* fall through */ }
 
   // Fallback: ask GitHub which PDFs are in data/
-  const api = `https://api.github.com/repos/${CONFIG.repo}/contents/${CONFIG.dataDir}?ref=${CONFIG.branch}`;
-  const r = await fetch(api, { headers: { Accept: 'application/vnd.github+json' } });
-  if (r.status === 404) return [];
-  if (!r.ok) throw new Error(`GitHub API ${r.status}`);
-  return (await r.json())
-    .filter((f) => f.type === 'file' && /\.pdf$/i.test(f.name))
-    .map((f) => ({ file: `${CONFIG.dataDir}/${f.name}`, name: f.name, title: titleFromName(f.name), size: f.size, date: null }))
-    .sort((a, b) => b.name.localeCompare(a.name, undefined, { numeric: true }));
+  try {
+    const api = `https://api.github.com/repos/${CONFIG.repo}/contents/${CONFIG.dataDir}?ref=${CONFIG.branch}`;
+    const r = await fetch(api, { headers: { Accept: 'application/vnd.github+json' } });
+    if (r.status === 404) return [];
+    if (!r.ok) throw new Error(`GitHub API ${r.status}`);
+    return (await r.json())
+      .filter((f) => f.type === 'file' && /\.pdf$/i.test(f.name))
+      .map((f) => ({ file: `${CONFIG.dataDir}/${f.name}`, name: f.name, title: titleFromName(f.name), size: f.size, date: null }))
+      .sort((a, b) => b.name.localeCompare(a.name, undefined, { numeric: true }));
+  } catch (err) {
+    const offline = catalogFromSaved();
+    if (offline.length) return offline;
+    throw err;
+  }
 }
 
 function renderSkeleton() {
@@ -159,6 +244,7 @@ function renderCatalog() {
       </div>`;
     li.dataset.i = i;
     m._el = li;
+    if (saved.has(absUrl(m))) markSaved(m);
     grid.appendChild(li);
     coverObserver.observe(li);
   });
@@ -356,6 +442,7 @@ async function openViewer(m, startPage = 1) {
   $('#vPage').textContent = '';
   $('#progressBar').style.width = '0';
   leafBase.replaceChildren();
+  resetZoom();
   book.style.width = book.style.height = '0';
   spinner.hidden = false;
   showHud(true);
@@ -374,11 +461,13 @@ async function openViewer(m, startPage = 1) {
     V.page = Math.min(Math.max(1, startPage), V.count);
     await showPage(V.page);
     prefetch();
+    saveOffline(m, doc);
   } catch (err) {
     if (gen !== V.gen) return;
     console.error(err);
     spinner.hidden = true;
-    toast('Sorry, this issue could not be opened.', 4000);
+    toast(navigator.onLine ? 'Sorry, this issue could not be opened.'
+      : 'You’re offline. Open this issue once while connected to read it offline.', 4500);
   }
 }
 
@@ -393,6 +482,9 @@ function closeViewer() {
   leafBase.replaceChildren();
   flipFront.replaceChildren();
   leafFlip.classList.remove('on');
+  resetZoom();
+  pts.clear();
+  pinch = ptr = null;
   stage.style.transform = stage.style.opacity = '';
   viewer.hidden = true;
   $('#coach').hidden = true;
@@ -480,6 +572,7 @@ const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
 
 async function flip(dir) {
   if (!V.doc) return;
+  if (zoomed() || pinch) { pinch = null; resetZoom(); }
   if (V.busy) { V.queued = Math.max(-5, Math.min(5, V.queued + dir)); return; }
   const target = V.page + dir;
   if (target < 1 || target > V.count) {
@@ -594,24 +687,167 @@ $('#coach').addEventListener('pointerdown', (e) => {
   if (!V.fsAsked) { enterFullscreen(); V.fsAsked = true; }
 });
 
-/* Gestures: tap left / right to turn pages, swipe right-to-left to go home */
-let ptr = null;
+/* ------------------------------------------------------------------ *
+ * Zoom: pinch with two fingers (or ctrl + scroll / trackpad pinch),
+ * drag to pan, double-tap or pinch back out to reset. Once the gesture
+ * settles, the visible part of the page is re-rendered at full sharpness.
+ * ------------------------------------------------------------------ */
+const Z = { s: 1, x: 0, y: 0, max: 5, timer: 0, gen: 0, task: null };
+const zoomed = () => Z.s > 1.01;
+
+function bookRect() {            // where the book sits on screen when not zoomed
+  const w = book.offsetWidth, h = book.offsetHeight;
+  return { bx: (stage.clientWidth - w) / 2, by: (stage.clientHeight - h) / 2, w, h };
+}
+
+function clampZoom() {
+  const { bx, by, w, h } = bookRect();
+  const W = stage.clientWidth, H = stage.clientHeight;
+  const sw = w * Z.s, sh = h * Z.s;
+  Z.x = sw <= W ? (w - sw) / 2 : Math.min(-bx, Math.max(W - bx - sw, Z.x));
+  Z.y = sh <= H ? (h - sh) / 2 : Math.min(-by, Math.max(H - by - sh, Z.y));
+}
+
+function applyZoom({ animate = false, clamp = true } = {}) {
+  if (clamp) clampZoom();
+  const t = Z.s !== 1 ? `translate(${Z.x}px, ${Z.y}px) scale(${Z.s})` : '';
+  if (animate && !reduceMotion) {
+    book.animate([{ transform: getComputedStyle(book).transform }, { transform: t || 'none' }],
+      { duration: 220, easing: 'ease-out' });
+  }
+  book.style.transform = t;
+  viewer.classList.toggle('zoomed', zoomed());
+  if (zoomed()) delete stage.dataset.zone;
+  scheduleHiRes();
+}
+
+/* Zoom to scale s, keeping the page point under (cx, cy) where it is. */
+function zoomAt(s, cx, cy, opts) {
+  const { bx, by } = bookRect();
+  const u = (cx - bx - Z.x) / Z.s;
+  const v = (cy - by - Z.y) / Z.s;
+  Z.s = Math.min(Z.max, Math.max(1, s));
+  if (Z.s < 1.01) Z.s = 1;
+  Z.x = cx - bx - Z.s * u;
+  Z.y = cy - by - Z.s * v;
+  applyZoom(opts);
+}
+
+function resetZoom(animate = false) {
+  if (Z.s === 1 && !book.style.transform) return;
+  Z.s = 1; Z.x = Z.y = 0;
+  applyZoom({ animate });
+}
+
+function scheduleHiRes() {
+  clearTimeout(Z.timer);
+  Z.gen++;
+  Z.task?.cancel();
+  Z.task = null;
+  if (!zoomed()) { $('.hires', book)?.remove(); return; }
+  Z.timer = setTimeout(renderHiRes, 160);
+}
+
+async function renderHiRes() {
+  if (!V.doc || !zoomed() || V.busy) return;
+  const gen = ++Z.gen, vgen = V.gen, n = V.page;
+  const { bx, by, w, h } = bookRect();
+  const W = stage.clientWidth, H = stage.clientHeight;
+  // Visible part of the page, in un-zoomed book pixels
+  const x0 = Math.max(0, (-bx - Z.x) / Z.s);
+  const y0 = Math.max(0, (-by - Z.y) / Z.s);
+  const x1 = Math.min(w, (W - bx - Z.x) / Z.s);
+  const y1 = Math.min(h, (H - by - Z.y) / Z.s);
+  if (x1 <= x0 || y1 <= y0) return;
+  const k = Z.s * Math.min(devicePixelRatio || 1, 3);    // device pixels per book pixel
+  try {
+    const page = await V.doc.getPage(n);
+    if (gen !== Z.gen || vgen !== V.gen) return;
+    const viewport = page.getViewport({ scale: (w / page.getViewport({ scale: 1 }).width) * k });
+    const c = document.createElement('canvas');
+    c.className = 'hires';
+    c.width = Math.ceil((x1 - x0) * k);
+    c.height = Math.ceil((y1 - y0) * k);
+    Object.assign(c.style, { left: `${x0}px`, top: `${y0}px`, width: `${c.width / k}px`, height: `${c.height / k}px` });
+    Z.task = page.render({ canvasContext: c.getContext('2d'), viewport, transform: [1, 0, 0, 1, -x0 * k, -y0 * k] });
+    await Z.task.promise;
+    if (gen !== Z.gen || vgen !== V.gen || V.page !== n || !zoomed()) { c.width = c.height = 0; return; }
+    const old = $('.hires', book);
+    book.appendChild(c);
+    if (old) { old.remove(); old.width = old.height = 0; }
+  } catch { /* cancelled by a newer gesture */ }
+}
+
+/* ------------------------------------------------------------------ *
+ * Gestures: tap left / right to turn pages, swipe right-to-left to go home,
+ * two fingers to zoom, one finger to pan while zoomed.
+ * ------------------------------------------------------------------ */
+const pts = new Map();   // active pointers
+let ptr = null;          // the single-pointer gesture in progress
+let pinch = null;
+let tapTimer = 0;
+let lastTap = 0;
 const SWIPE_MIN = 60;
 
+function startPinch() {
+  if (ptr?.dragging) { stage.style.transform = stage.style.opacity = ''; }
+  ptr = null;
+  if (V.busy || !V.doc) return;
+  const [a, b] = [...pts.values()];
+  const cx = (a.x + b.x) / 2, cy = (a.y + b.y) / 2;
+  const { bx, by } = bookRect();
+  book.getAnimations().forEach((x) => x.cancel());
+  pinch = { d0: Math.hypot(a.x - b.x, a.y - b.y) || 1, s0: Z.s, u: (cx - bx - Z.x) / Z.s, v: (cy - by - Z.y) / Z.s };
+}
+
+function movePinch() {
+  const [a, b] = [...pts.values()];
+  const cx = (a.x + b.x) / 2, cy = (a.y + b.y) / 2;
+  const { bx, by } = bookRect();
+  // allow a little rubber-band past the limits while the fingers are down
+  Z.s = Math.min(Z.max * 1.15, Math.max(0.85, pinch.s0 * Math.hypot(a.x - b.x, a.y - b.y) / pinch.d0));
+  Z.x = cx - bx - Z.s * pinch.u;
+  Z.y = cy - by - Z.s * pinch.v;
+  applyZoom({ clamp: false });
+}
+
+function endPinch() {
+  pinch = null;
+  Z.s = Math.min(Z.max, Z.s);
+  if (Z.s < 1.05) { Z.s = 1; Z.x = Z.y = 0; }
+  applyZoom({ animate: true });
+}
+
 stage.addEventListener('pointerdown', (e) => {
-  if (!e.isPrimary || (e.pointerType === 'mouse' && e.button !== 0)) return;
-  ptr = { id: e.pointerId, x: e.clientX, y: e.clientY, t: performance.now(), dragging: false };
+  if (e.pointerType === 'mouse' && e.button !== 0) return;
+  pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
   try { stage.setPointerCapture(e.pointerId); } catch { /* ignore */ }
+  if (pts.size === 2) { startPinch(); return; }
+  if (pts.size > 2 || pinch) return;
+  ptr = { id: e.pointerId, x: e.clientX, y: e.clientY, dragging: false, pan: zoomed(), ox: Z.x, oy: Z.y };
 });
 
 stage.addEventListener('pointermove', (e) => {
-  if (!ptr) {
-    if (e.pointerType === 'mouse') stage.dataset.zone = zoneOf(e.clientX);
+  const p = pts.get(e.pointerId);
+  if (!p) {
+    if (e.pointerType === 'mouse' && !zoomed()) stage.dataset.zone = zoneOf(e.clientX);
     return;
   }
-  if (e.pointerId !== ptr.id) return;
+  p.x = e.clientX;
+  p.y = e.clientY;
+  if (pinch) { if (pts.size >= 2) movePinch(); return; }
+  if (!ptr || e.pointerId !== ptr.id) return;
   const dx = e.clientX - ptr.x;
   const dy = e.clientY - ptr.y;
+
+  if (ptr.pan) {
+    if (Math.hypot(dx, dy) > 8) ptr.moved = true;
+    Z.x = ptr.ox + dx;
+    Z.y = ptr.oy + dy;
+    applyZoom();
+    return;
+  }
+
   if (!ptr.dragging && dx < -12 && Math.abs(dx) > Math.abs(dy) * 1.3) ptr.dragging = true;
   if (ptr.dragging) {
     const d = Math.min(0, dx);
@@ -621,18 +857,41 @@ stage.addEventListener('pointermove', (e) => {
 });
 
 function endPointer(e, cancelled) {
+  if (!pts.delete(e.pointerId)) return;
+
+  if (pinch) {
+    if (pts.size < 2) {
+      endPinch();
+      if (pts.size === 1) {          // the finger still down keeps panning, but never taps
+        const [[id, p]] = pts;
+        ptr = { id, x: p.x, y: p.y, pan: true, moved: true, ox: Z.x, oy: Z.y };
+      }
+    }
+    return;
+  }
   if (!ptr || e.pointerId !== ptr.id) return;
   const dx = e.clientX - ptr.x;
   const dy = e.clientY - ptr.y;
-  const wasDrag = ptr.dragging;
+  const g = ptr;
   ptr = null;
+
+  if (g.pan) {
+    if (cancelled || g.moved) return;
+    // Zoomed in: double-tap zooms back out, single tap shows/hides the toolbar.
+    const now = performance.now();
+    clearTimeout(tapTimer);
+    if (now - lastTap < 300) { lastTap = 0; resetZoom(true); return; }
+    lastTap = now;
+    tapTimer = setTimeout(toggleHud, 300);
+    return;
+  }
 
   if (!cancelled && dx < -SWIPE_MIN && Math.abs(dx) > Math.abs(dy) * 1.3) {
     // right-to-left swipe -> home
     stage.animate([
       { transform: stage.style.transform || 'translateX(0)', opacity: stage.style.opacity || 1 },
       { transform: `translateX(${-window.innerWidth}px)`, opacity: 0 },
-    ], { duration: 220, easing: 'ease-in', fill: 'forwards' }).finished.then((a) => {
+    ], { duration: 220, easing: 'ease-in', fill: 'forwards' }).finished.then(() => {
       goHome();
       stage.getAnimations().forEach((x) => x.cancel());
       stage.style.transform = stage.style.opacity = '';
@@ -640,7 +899,7 @@ function endPointer(e, cancelled) {
     return;
   }
 
-  if (wasDrag || stage.style.transform) {
+  if (g.dragging || stage.style.transform) {
     stage.animate([{ transform: stage.style.transform, opacity: stage.style.opacity }, { transform: 'translateX(0)', opacity: 1 }],
       { duration: 180, easing: 'ease-out' });
     stage.style.transform = stage.style.opacity = '';
@@ -659,6 +918,26 @@ stage.addEventListener('pointercancel', (e) => endPointer(e, true));
 stage.addEventListener('pointerleave', (e) => { if (e.pointerType === 'mouse' && !ptr) delete stage.dataset.zone; });
 stage.addEventListener('contextmenu', (e) => e.preventDefault());
 
+/* Desktop: ctrl + scroll (and trackpad pinch) zooms, plain scroll pans while zoomed. */
+stage.addEventListener('wheel', (e) => {
+  if (!V.doc || V.busy) return;
+  if (e.ctrlKey || e.metaKey) {
+    e.preventDefault();
+    const d = e.deltaMode === 1 ? e.deltaY * 16 : e.deltaY;
+    zoomAt(Z.s * Math.exp(-d * 0.01), e.clientX, e.clientY);
+  } else if (zoomed()) {
+    e.preventDefault();
+    Z.x -= e.deltaX;
+    Z.y -= e.deltaY;
+    applyZoom();
+  }
+}, { passive: false });
+
+// iOS Safari: stop its own page zoom from fighting ours inside the reader
+for (const t of ['gesturestart', 'gesturechange']) {
+  document.addEventListener(t, (e) => { if (V.m) e.preventDefault(); }, { passive: false });
+}
+
 function zoneOf(x) {
   const r = x / window.innerWidth;
   return r < 0.4 ? 'l' : r > 0.6 ? 'r' : 'c';
@@ -667,10 +946,15 @@ function zoneOf(x) {
 document.addEventListener('keydown', (e) => {
   if (!V.m) return;
   if (!$('#coach').hidden) { $('#coach').hidden = true; store.set('mag.coach', '1'); }
+  const cx = stage.clientWidth / 2, cy = stage.clientHeight / 2;
   switch (e.key) {
     case 'ArrowRight': case 'PageDown': case ' ': e.preventDefault(); flip(1); break;
     case 'ArrowLeft': case 'PageUp': e.preventDefault(); flip(-1); break;
-    case 'Escape': case 'Home': goHome(); break;
+    case '+': case '=': e.preventDefault(); zoomAt(Z.s * 1.5, cx, cy, { animate: true }); break;
+    case '-': case '_': e.preventDefault(); zoomAt(Z.s / 1.5, cx, cy, { animate: true }); break;
+    case '0': e.preventDefault(); resetZoom(true); break;
+    case 'Escape': if (zoomed()) resetZoom(true); else goHome(); break;
+    case 'Home': goHome(); break;
     default: break;
   }
 });
@@ -683,6 +967,7 @@ window.addEventListener('resize', () => {
     if (!V.doc || V.busy) return;
     for (const p of V.cache.values()) p.then((c) => { c.width = c.height = 0; }).catch(() => {});
     V.cache.clear();
+    resetZoom();
     layoutBook();
     showPage(V.page).then(prefetch);
   }, 200);
@@ -696,10 +981,12 @@ window.addEventListener('hashchange', route);
  * ------------------------------------------------------------------ */
 (async function boot() {
   renderSkeleton();
+  await loadSaved();
   if (parseHash()) route();   // deep link: open the reader right away
   try {
     catalog = await loadCatalog();
     renderCatalog();
+    pruneSaved();
     if (V.m) { // upgrade deep-linked metadata with the catalog entry
       const m = catalog.find((x) => x.file === V.m.file);
       if (m) { Object.assign(V.m, { title: m.title, size: m.size, date: m.date }); $('#vTitle').textContent = m.title; }
