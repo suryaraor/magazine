@@ -9,7 +9,7 @@
  *
  * Bump VERSION whenever a shell file changes so readers pick up the update.
  */
-const VERSION = 'v1';
+const VERSION = 'v2';
 const SHELL = `mag-shell-${VERSION}`;
 const RUNTIME = 'mag-runtime';
 const ISSUES = 'mag-issues';

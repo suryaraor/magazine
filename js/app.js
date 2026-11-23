@@ -361,6 +361,7 @@ function playFlip() {
  * ------------------------------------------------------------------ */
 const viewer = $('#viewer');
 const stage = $('#stage');
+const scroller = $('#scroller');
 const book = $('#book');
 const leafBase = $('#leafBase');
 const leafFlip = $('#leafFlip');
@@ -375,6 +376,7 @@ const V = {
   m: null, doc: null, page: 1, count: 0,
   cache: new Map(), busy: false, queued: 0, gen: 0,
   pushed: false, fsAsked: false, size: null,
+  fitW: store.get('mag.fit') === 'width',   // fit to width (Ctrl+L), scroll through the page
 };
 
 function enterFullscreen() {
@@ -438,6 +440,8 @@ async function openViewer(m, startPage = 1) {
   void viewer.offsetWidth;
   viewer.classList.add('enter');
   viewer.classList.toggle('muted', !soundOn);
+  viewer.classList.toggle('fitw', V.fitW);
+  scroller.scrollTop = 0;
   $('#vTitle').textContent = m.title;
   $('#vPage').textContent = '';
   $('#progressBar').style.width = '0';
@@ -496,6 +500,11 @@ function closeViewer() {
 }
 
 function fit(vp) {
+  if (V.fitW) {
+    // Full width of the reader, minus its scrollbar; height runs as long as it needs.
+    const s = (scroller.clientWidth || window.innerWidth) / vp.width;
+    return { w: Math.floor(vp.width * s), h: Math.floor(vp.height * s), s };
+  }
   const W = window.innerWidth;
   const H = window.innerHeight;
   const pad = W < 700 ? 0 : 24;
@@ -570,7 +579,7 @@ function updateHud() {
 
 const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
 
-async function flip(dir) {
+async function flip(dir, { toEnd = false } = {}) {
   if (!V.doc) return;
   if (zoomed() || pinch) { pinch = null; resetZoom(); }
   if (V.busy) { V.queued = Math.max(-5, Math.min(5, V.queued + dir)); return; }
@@ -591,6 +600,24 @@ async function flip(dir) {
     if (gen !== V.gen) return;
     spinner.hidden = true;
     playFlip();
+
+    if (V.fitW) {
+      // Fit to width reads like a scroll: the next page slides up from below,
+      // the previous one comes down from above, scrolled to its end.
+      const shade = document.createElement('div');
+      shade.className = 'lift-shade';
+      leafBase.replaceChildren(nxt, shade);
+      V.page = target;
+      scroller.scrollTop = dir < 0 && toEnd ? scroller.scrollHeight : 0;
+      wheel.lockUntil = performance.now() + 500;
+      updateHud();
+      prefetch();
+      if (!reduceMotion) {
+        await book.animate([{ transform: `translateY(${dir * 48}px)`, opacity: 0 }, { transform: 'none', opacity: 1 }],
+          { duration: 260, easing: 'ease-out' }).finished;
+      }
+      return;
+    }
 
     const curl = document.createElement('div');
     curl.className = 'curl-shade';
@@ -643,7 +670,7 @@ async function flip(dir) {
     if (V.queued && gen === V.gen) {
       const step = Math.sign(V.queued);
       V.queued -= step;
-      flip(step);
+      flip(step, { toEnd });
     }
   }
 }
@@ -723,6 +750,7 @@ function applyZoom({ animate = false, clamp = true } = {}) {
 
 /* Zoom to scale s, keeping the page point under (cx, cy) where it is. */
 function zoomAt(s, cx, cy, opts) {
+  if (V.fitW) return;            // the page already fills the width
   const { bx, by } = bookRect();
   const u = (cx - bx - Z.x) / Z.s;
   const v = (cy - by - Z.y) / Z.s;
@@ -792,7 +820,7 @@ const SWIPE_MIN = 60;
 function startPinch() {
   if (ptr?.dragging) { stage.style.transform = stage.style.opacity = ''; }
   ptr = null;
-  if (V.busy || !V.doc) return;
+  if (V.busy || !V.doc || V.fitW) return;
   const [a, b] = [...pts.values()];
   const cx = (a.x + b.x) / 2, cy = (a.y + b.y) / 2;
   const { bx, by } = bookRect();
@@ -820,6 +848,8 @@ function endPinch() {
 
 stage.addEventListener('pointerdown', (e) => {
   if (e.pointerType === 'mouse' && e.button !== 0) return;
+  // Leave the scrollbar alone: a press there is a scroll, not a tap on the page.
+  if (V.fitW && e.clientX >= scroller.getBoundingClientRect().left + scroller.clientWidth) return;
   pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
   try { stage.setPointerCapture(e.pointerId); } catch { /* ignore */ }
   if (pts.size === 2) { startPinch(); return; }
@@ -918,9 +948,62 @@ stage.addEventListener('pointercancel', (e) => endPointer(e, true));
 stage.addEventListener('pointerleave', (e) => { if (e.pointerType === 'mouse' && !ptr) delete stage.dataset.zone; });
 stage.addEventListener('contextmenu', (e) => e.preventDefault());
 
+/* Fit to width: scroll the page natively; pushing past its end (or top) turns
+ * to the next (or previous) page. Only a fresh push counts, not the tail end of
+ * the scroll that reached the edge, so a fast flick never skips a page. */
+const wheel = { acc: 0, dir: 0, lastMove: 0, lockUntil: 0 };
+scroller.addEventListener('scroll', () => { wheel.lastMove = performance.now(); wheel.acc = 0; }, { passive: true });
+
+function atPageEdge(dir) {
+  return dir > 0
+    ? scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 2
+    : scroller.scrollTop <= 1;
+}
+
+function fitWidthWheel(e) {
+  const now = performance.now();
+  if (V.busy || now < wheel.lockUntil) { e.preventDefault(); return; }
+  const dy = e.deltaMode === 1 ? e.deltaY * 16 : e.deltaMode === 2 ? e.deltaY * scroller.clientHeight : e.deltaY;
+  const dir = Math.sign(dy);
+  if (!dir || !atPageEdge(dir)) { wheel.acc = 0; return; }   // normal scrolling
+  e.preventDefault();
+  const fresh = now - wheel.lastMove > 200;
+  wheel.lastMove = now;
+  if (!fresh && wheel.acc === 0) return;                      // still the scroll that got here
+  if (dir !== wheel.dir) { wheel.dir = dir; wheel.acc = 0; }
+  wheel.acc += Math.abs(dy);
+  if (wheel.acc < 80) return;
+  wheel.acc = 0;
+  flip(dir, { toEnd: true });
+}
+
+/* Scroll the fit-to-width page by `dy`; at the edge, turn the page instead. */
+function fitWidthScroll(dy) {
+  const dir = Math.sign(dy);
+  if (atPageEdge(dir)) flip(dir, { toEnd: dir < 0 });
+  else scroller.scrollBy({ top: dy, behavior: reduceMotion ? 'auto' : 'smooth' });
+}
+
+function setFitWidth(on) {
+  V.fitW = on;
+  store.set('mag.fit', on ? 'width' : 'page');
+  viewer.classList.toggle('fitw', on);
+  resetZoom();
+  relayout();
+  scroller.scrollTop = 0;
+  toast(on ? 'Fit to width. Scroll past the end for the next page. Ctrl+L to fit the page.'
+    : 'Fit to page. Ctrl+L to fit the width.', 2600);
+}
+
 /* Desktop: ctrl + scroll (and trackpad pinch) zooms, plain scroll pans while zoomed. */
 stage.addEventListener('wheel', (e) => {
-  if (!V.doc || V.busy) return;
+  if (!V.doc) return;
+  if (V.fitW) {
+    if (e.ctrlKey || e.metaKey) e.preventDefault();          // no zoom: the page already fills the width
+    else fitWidthWheel(e);
+    return;
+  }
+  if (V.busy) return;
   if (e.ctrlKey || e.metaKey) {
     e.preventDefault();
     const d = e.deltaMode === 1 ? e.deltaY * 16 : e.deltaY;
@@ -946,6 +1029,19 @@ function zoneOf(x) {
 document.addEventListener('keydown', (e) => {
   if (!V.m) return;
   if (!$('#coach').hidden) { $('#coach').hidden = true; store.set('mag.coach', '1'); }
+  if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && e.key.toLowerCase() === 'l') {
+    e.preventDefault();          // instead of jumping to the address bar
+    setFitWidth(!V.fitW);
+    return;
+  }
+  if (V.fitW && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    const step = { ArrowDown: 80, ArrowUp: -80, PageDown: 0.9, PageUp: -0.9, ' ': e.shiftKey ? -0.9 : 0.9 }[e.key];
+    if (step) {
+      e.preventDefault();
+      fitWidthScroll(Math.abs(step) < 1 ? step * scroller.clientHeight : step);
+      return;
+    }
+  }
   const cx = stage.clientWidth / 2, cy = stage.clientHeight / 2;
   switch (e.key) {
     case 'ArrowRight': case 'PageDown': case ' ': e.preventDefault(); flip(1); break;
@@ -959,18 +1055,21 @@ document.addEventListener('keydown', (e) => {
   }
 });
 
+/* Re-render the current page at the new size (window resized or fit mode changed). */
+function relayout() {
+  if (!V.doc || V.busy) return;
+  for (const p of V.cache.values()) p.then((c) => { c.width = c.height = 0; }).catch(() => {});
+  V.cache.clear();
+  resetZoom();
+  layoutBook();
+  showPage(V.page).then(prefetch);
+}
+
 let resizeTimer;
 window.addEventListener('resize', () => {
   if (!V.doc) return;
   clearTimeout(resizeTimer);
-  resizeTimer = setTimeout(() => {
-    if (!V.doc || V.busy) return;
-    for (const p of V.cache.values()) p.then((c) => { c.width = c.height = 0; }).catch(() => {});
-    V.cache.clear();
-    resetZoom();
-    layoutBook();
-    showPage(V.page).then(prefetch);
-  }, 200);
+  resizeTimer = setTimeout(relayout, 200);
 });
 
 window.addEventListener('popstate', route);

@@ -28,7 +28,7 @@ before adding them.
 | Reader | Tap the **right side** for the next page, **left side** for the previous one |
 | Reader | **Swipe right-to-left** to go back to the list of issues |
 | Reader | Tap the **middle** to show or hide the toolbar (sound, download, share) |
-| Desktop | ← / → arrow keys turn pages, Esc goes back to the list |
+| Desktop | ← / → arrow keys turn pages, Esc goes back to the list. Ctrl+L switches between fit-to-page and fit-to-width; in fit-to-width, scroll down past the end of a page to go to the next one (and up past the top for the previous one) |
 
 Shared links open straight into the issue (`…/magazine/#read=data/<file>.pdf`).
 
